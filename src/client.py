@@ -6,7 +6,7 @@ from datetime import datetime
 
 
 class WebSocketClient:
-    def __init__(self, uri="ws://localhost:8765"):
+    def __init__(self, uri="ws://192.168.101.102:3100"):
         self.uri = uri
         self.websocket = None
         self.is_connected = False
