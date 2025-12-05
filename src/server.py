@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 import logging
 import socket
-from typing import List, Dict
+from typing import List, Dict, Optional
 import random
 
 # 设置日志格式，包含具体时间（精确到毫秒）
@@ -69,8 +69,9 @@ class WebSocketServer:
         self.host = host if host else choose_best_ip()
         self.port = port
         self.connected_clients = set()
-        # 存储每个客户端的播放状态
-        self.playback_status: Dict[int, Dict] = {}  # client_id -> {actionGroupID: status_data}
+        # 存储每个客户端的播放状态和任务
+        self.client_playback_tasks: Dict[int, Dict] = {}  # client_id -> {actionGroupID: task}
+        self.client_current_playing: Dict[int, Optional[int]] = {}  # client_id -> current_playing_actionGroupID
 
     async def send_ack(self, websocket, original_message, status="processed"):
         """发送ack确认消息"""
@@ -86,32 +87,18 @@ class WebSocketServer:
 
     async def simulate_playback(self, websocket, client_id, action_group_id):
         """模拟播放进度"""
-        # 设置播放状态
-        if client_id not in self.playback_status:
-            self.playback_status[client_id] = {}
-
-        self.playback_status[client_id][action_group_id] = {
-            'playing': True,
-            'current_progress': 0.0,
-            'websocket': websocket
-        }
-
         logger.info(f"开始为客户端 {client_id} 模拟播放，actionGroupID: {action_group_id}")
 
         # 发送播放进度消息（5-10次随机进度更新）
         progress_steps = random.randint(5, 10)
         for i in range(progress_steps):
-            # 检查是否还在播放状态
-            if (client_id not in self.playback_status or
-                    action_group_id not in self.playback_status[client_id] or
-                    not self.playback_status[client_id][action_group_id]['playing']):
+            # 检查是否还在播放状态（通过检查任务是否还存在）
+            if (client_id not in self.client_playback_tasks or
+                    action_group_id not in self.client_playback_tasks[client_id]):
                 logger.info(f"播放被停止，actionGroupID: {action_group_id}")
                 return
 
             progress_value = min(100.0, float((i + 1) * 100.0 / progress_steps))
-
-            # 更新进度
-            self.playback_status[client_id][action_group_id]['current_progress'] = progress_value
 
             # 发送播放进度消息
             progress_msg = {
@@ -126,7 +113,8 @@ class WebSocketServer:
 
             try:
                 await websocket.send(json.dumps(progress_msg, ensure_ascii=False))
-                logger.info(f"向客户端 {client_id} 发送播放进度: {progress_value:.2f}%, actionGroupID: {action_group_id}")
+                logger.info(
+                    f"向客户端 {client_id} 发送播放进度: {progress_value:.2f}%, actionGroupID: {action_group_id}")
             except:
                 logger.error(f"向客户端 {client_id} 发送消息失败")
                 break
@@ -134,10 +122,9 @@ class WebSocketServer:
             # 随机延迟0.5-2秒
             await asyncio.sleep(random.uniform(0.5, 2.0))
 
-        # 检查是否还在播放状态（可能被actionStop中断）
-        if (client_id in self.playback_status and
-                action_group_id in self.playback_status[client_id] and
-                self.playback_status[client_id][action_group_id]['playing']):
+        # 检查是否还在播放状态（可能被actionStop或actionReset中断）
+        if (client_id in self.client_playback_tasks and
+                action_group_id in self.client_playback_tasks[client_id]):
 
             # 发送播放结束消息
             end_msg = {
@@ -157,15 +144,58 @@ class WebSocketServer:
                 logger.error(f"向客户端 {client_id} 发送结束消息失败")
 
             # 清理播放状态
-            if client_id in self.playback_status and action_group_id in self.playback_status[client_id]:
-                del self.playback_status[client_id][action_group_id]
+            self._cleanup_playback_task(client_id, action_group_id)
+
+    def _cleanup_playback_task(self, client_id: int, action_group_id: int):
+        """清理播放任务"""
+        if client_id in self.client_playback_tasks:
+            if action_group_id in self.client_playback_tasks[client_id]:
+                # 取消任务（如果还在运行）
+                task = self.client_playback_tasks[client_id][action_group_id]
+                if not task.done():
+                    task.cancel()
+                del self.client_playback_tasks[client_id][action_group_id]
+
+            # 如果该客户端没有其他任务了，清理整个客户端的记录
+            if not self.client_playback_tasks[client_id]:
+                del self.client_playback_tasks[client_id]
+
+        # 更新当前播放状态
+        if (client_id in self.client_current_playing and
+                self.client_current_playing[client_id] == action_group_id):
+            self.client_current_playing[client_id] = None
+
+    async def _stop_all_playback(self, client_id: int, websocket):
+        """停止客户端的所有播放任务"""
+        if client_id not in self.client_playback_tasks:
+            return
+
+        # 复制keys避免在迭代时修改字典
+        action_group_ids = list(self.client_playback_tasks[client_id].keys())
+
+        for action_group_id in action_group_ids:
+            self._cleanup_playback_task(client_id, action_group_id)
+            logger.info(f"客户端 {client_id} 停止播放，actionGroupID: {action_group_id}")
+
+        # 发送重置确认
+        reset_ack = {
+            "type": "actionResetAck",
+            "data": {
+                "status": "reset",
+                "message": "所有播放已停止并重置",
+                "actionGroupID": 0
+            },
+            "timestamp": int(datetime.now().timestamp() * 1000)
+        }
+        await websocket.send(json.dumps(reset_ack, ensure_ascii=False))
 
     async def handle_client(self, websocket):
         """处理客户端连接"""
         client_id = id(websocket)
         self.connected_clients.add(websocket)
         # 初始化客户端的播放状态
-        self.playback_status[client_id] = {}
+        self.client_playback_tasks[client_id] = {}
+        self.client_current_playing[client_id] = None
         logger.info(f"客户端 {client_id} 已连接，当前连接数: {len(self.connected_clients)}")
 
         try:
@@ -190,8 +220,16 @@ class WebSocketServer:
             logger.error(f"处理客户端 {client_id} 时发生错误: {e}")
         finally:
             # 清理客户端状态
-            if client_id in self.playback_status:
-                del self.playback_status[client_id]
+            if client_id in self.client_playback_tasks:
+                # 取消所有正在运行的任务
+                for action_group_id, task in self.client_playback_tasks[client_id].items():
+                    if not task.done():
+                        task.cancel()
+                del self.client_playback_tasks[client_id]
+
+            if client_id in self.client_current_playing:
+                del self.client_current_playing[client_id]
+
             if websocket in self.connected_clients:
                 self.connected_clients.remove(websocket)
             logger.info(f"客户端 {client_id} 已移除，当前连接数: {len(self.connected_clients)}")
@@ -224,13 +262,22 @@ class WebSocketServer:
                     await websocket.send(json.dumps(error_msg, ensure_ascii=False))
                     return
 
-                # 如果该actionGroupID已经在播放，先停止之前的
-                if (client_id in self.playback_status and
-                        action_group_id in self.playback_status[client_id]):
-                    self.playback_status[client_id][action_group_id]['playing'] = False
+                # 如果已经有播放任务在运行，先停止之前的
+                if (client_id in self.client_current_playing and
+                        self.client_current_playing[client_id] is not None):
+                    current_playing_id = self.client_current_playing[client_id]
+                    if current_playing_id in self.client_playback_tasks.get(client_id, {}):
+                        self._cleanup_playback_task(client_id, current_playing_id)
+                        logger.info(f"停止之前的播放任务，actionGroupID: {current_playing_id}")
 
-                # 在后台任务中开始播放模拟
-                asyncio.create_task(self.simulate_playback(websocket, client_id, action_group_id))
+                # 创建新的播放任务
+                task = asyncio.create_task(self.simulate_playback(websocket, client_id, action_group_id))
+
+                # 存储任务引用
+                if client_id not in self.client_playback_tasks:
+                    self.client_playback_tasks[client_id] = {}
+                self.client_playback_tasks[client_id][action_group_id] = task
+                self.client_current_playing[client_id] = action_group_id
 
                 # 发送开始确认
                 start_ack = {
@@ -258,10 +305,10 @@ class WebSocketServer:
                     await websocket.send(json.dumps(error_msg, ensure_ascii=False))
                     return
 
-                # 停止播放
-                if (client_id in self.playback_status and
-                        action_group_id in self.playback_status[client_id]):
-                    self.playback_status[client_id][action_group_id]['playing'] = False
+                # 停止指定actionGroupID的播放
+                if (client_id in self.client_playback_tasks and
+                        action_group_id in self.client_playback_tasks[client_id]):
+                    self._cleanup_playback_task(client_id, action_group_id)
 
                     # 发送停止确认
                     stop_ack = {
@@ -286,6 +333,11 @@ class WebSocketServer:
                         "timestamp": int(datetime.now().timestamp() * 1000)
                     }
                     await websocket.send(json.dumps(error_msg, ensure_ascii=False))
+
+            elif msg_type == 'actionReset':
+                # 重置所有播放
+                await self._stop_all_playback(client_id, websocket)
+                logger.info(f"客户端 {client_id} 重置所有播放任务")
 
             elif msg_type == 'echo':
                 # 回声测试
@@ -325,6 +377,18 @@ class WebSocketServer:
                     "timestamp": int(datetime.now().timestamp() * 1000)
                 }
                 await websocket.send(json.dumps(server_info, ensure_ascii=False))
+
+            elif msg_type == 'heartbeat':
+                # 心跳响应
+                heartbeat_ack = {
+                    "type": "heartbeatAck",
+                    "data": {
+                        "status": "alive",
+                        "message": "服务器运行正常"
+                    },
+                    "timestamp": int(datetime.now().timestamp() * 1000)
+                }
+                await websocket.send(json.dumps(heartbeat_ack, ensure_ascii=False))
 
             else:
                 # 未知消息类型的默认响应
