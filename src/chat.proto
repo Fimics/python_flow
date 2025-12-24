@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package pb;
+
+message Request {
+    string message = 1;
+    int32 user_id = 2;
+}
+
+// 响应消息
+message Response {
+    string reply = 1;
+    bool success = 2;
+    int32 code = 3;
+}
+
+// 服务定义 - 使用 service 关键字
+service ChatService {
+    rpc SendMessage(Request) returns (Response);
+}
